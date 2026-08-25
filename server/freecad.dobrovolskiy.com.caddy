@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 Dmitriy Dobrovolskiy dima@dobrovolskiy.com
+
+# Installed to /opt/infra/Caddyfile.d/ - picked up by the central Caddy's import.
+freecad.dobrovolskiy.com {
+    encode zstd gzip
+
+    reverse_proxy freegad:8000 {
+        header_up Host {host}
+        header_up X-Real-IP {remote_host}
+    }
+
+    log {
+        output stdout
+        format json
+    }
+}

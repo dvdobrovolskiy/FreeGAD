@@ -1,0 +1,26 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 Dmitriy Dobrovolskiy dima@dobrovolskiy.com
+
+# /opt/freegad on the VPS. The shared Caddy (/opt/infra, network infra_net) terminates TLS for
+# freecad.dobrovolskiy.com and proxies to freegad:8000 (see freecad.dobrovolskiy.com.caddy).
+name: freegad
+
+networks:
+  infra_net:
+    external: true
+
+volumes:
+  freegad_data:
+
+services:
+  freegad:
+    build: .
+    image: freegad-telemetry:latest
+    container_name: freegad
+    restart: unless-stopped
+    env_file: .env            # ADMIN_USER, ADMIN_PASSWORD, SECRET_KEY
+    environment:
+      DATA_DIR: /app/data
+    volumes:
+      - freegad_data:/app/data   # SQLite DB
+    networks: [infra_net]
