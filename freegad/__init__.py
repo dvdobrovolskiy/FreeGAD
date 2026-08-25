@@ -2,4 +2,4 @@
 # Copyright (C) 2026 Dmitriy Dobrovolskiy dima@dobrovolskiy.com
 
 """FreeGAD - Claude-powered AI assistant embedded in FreeCAD."""
-__version__ = "1.0.1"
+__version__ = "1.0.2"

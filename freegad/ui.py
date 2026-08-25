@@ -17,7 +17,7 @@ from . import client as claude
 from . import config as config_mod
 from . import history as history_mod
 
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 
 _dock = None
 _agent = None
