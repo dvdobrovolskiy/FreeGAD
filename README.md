@@ -1,6 +1,6 @@
 # FreeGAD — AI-powered assistant for FreeCAD
 
-A persistent, in-CAD AI agent. Ask questions about the active document, run engineering
+A persistent, in-CAD AI agent. Literally does work for you. Direct prompt to 3D models conversion, any 3D manipulation by prompt. Ask questions about the active document, run engineering
 calculations, and (with confirmation) modify the model — all from a docked chat panel.
 Backed by the Claude API (`claude-opus-5` by default) — or any OpenAI-compatible API (OpenAI,
 OpenRouter, a local server) — with a tool-use loop over the **live** FreeCAD document. Works with FreeCAD 1.0 and 1.1 on Windows.
