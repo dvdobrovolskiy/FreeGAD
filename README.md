@@ -5,6 +5,20 @@ calculations, and (with confirmation) modify the model — all from a docked cha
 Backed by the Claude API (`claude-opus-5` by default) — or any OpenAI-compatible API (OpenAI,
 OpenRouter, a local server) — with a tool-use loop over the **live** FreeCAD document. Works with FreeCAD 1.0 and 1.1 on Windows.
 
+Cost & context
+- Prompt caching — two cache breakpoints: one on the system prompt (persona + document snapshot), one on the conversation tail. Each tool iteration re-reads the growing history at 1/10 price; data showed 99.99 % of input tokens served from cache.
+- Per-turn cost line — after each answer: API calls, uncached input, cache-read, cache-write, output tokens and an estimated $ (list prices per model; OpenRouter's real cost when available), plus a running session total.
+- History compaction — at the start of each turn, tool results from earlier turns are shrunk to 600 chars and old screenshots dropped; single tool results are capped at 14k chars.
+- Persona guidance — the model is told to plan explore → act → verify as three run_python calls, not five, and take at most one screenshot per edit cycle.
+
+Safety of run_python
+- Watchdog — scripts are aborted after 120 s; the GUI repaints every 0.5 s while a script runs so FreeCAD doesn't look frozen.
+- Memory guard — a script that grows FreeCAD's memory by more than half the RAM, or leaves less than ~8 % free, is aborted (sticky, memory released) with advice on doing the job with less geometry. 
+- Tool description warns about boolean loops and the time/memory limits.
+
+Chat UI
+- Image attachments — paste screenshots/images from the clipboard or drop image files into the input; shown as thumbnails, downscaled to 1568 px, JPEG fallback for big photos, sent with the prompt.
+
 What AI can do inside FreeCAD:
 
 - **See the document** — a compact snapshot (objects, types, dependencies, bounding boxes,
