@@ -5,7 +5,7 @@
 <package format="1" xmlns="https://wiki.freecad.org/Package_Metadata">
   <name>FreeGAD</name>
   <description>Claude-powered AI assistant embedded in FreeCAD: chat about the active document, let Claude inspect and modify it, with persistent memory.</description>
-  <version>1.0.2</version>
+  <version>1.0.3</version>
   <maintainer email="dvdobrovolskiy@gmail.com">Dmitry Dobrovolskiy</maintainer>
   <license file="LICENSE">AGPL-3.0-or-later</license>
   <freecadmin>1.0.0</freecadmin>

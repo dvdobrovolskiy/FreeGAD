@@ -4,10 +4,13 @@
 """Tool schemas + executors. Every executor runs on the GUI thread (see ui.MainBridge)."""
 import base64
 import contextlib
+import gc
 import io
 import json
 import os
+import sys
 import tempfile
+import time
 import traceback
 
 import FreeCAD as App
@@ -17,7 +20,12 @@ try:
 except Exception:
     Gui = None
 
-from . import context
+try:
+    from PySide import QtCore, QtWidgets
+except Exception:
+    QtWidgets = None
+
+from . import context, telemetry
 
 
 # ------------------------------------------------------------------ schemas
@@ -77,7 +85,14 @@ def schemas():
               "Print what you want to see; stdout, the return value of a final expression, and a "
               "summary of added/removed objects are returned. The code runs inside one undo "
               "transaction and recomputes the document afterwards. Keep scripts focused; call "
-              "get_object/get_context afterwards to verify the result. The user confirms before it runs.",
+              "get_object/get_context afterwards to verify the result. The user confirms before it runs. "
+              "SPEED: the script blocks the whole GUI and is ABORTED after a time limit (120 s unless "
+              "the user changed it in Settings), or as soon as it makes FreeCAD's memory grow by more "
+              "than half of the machine's RAM (heavy booleans / tessellation on complex solids allocate "
+              "gigabytes and freeze the whole PC; the user can disable this guard). Boolean operations "
+              "(common/cut/slice/section) on complex solids cost seconds EACH - never loop them over "
+              "many sample points/heights. Prefer BoundBox, distToShape, face/edge queries, or one "
+              "slice call with several planes; split genuinely long jobs into multiple calls.",
               [("code", "string", "Python source to execute."),
                ("purpose", "string", "One line shown to the user describing what the code does.")],
               ["code", "purpose"]),
@@ -363,6 +378,100 @@ def _doc_delta(doc, before):
     return {"added": added, "removed": removed, "objects_in_error": errs}
 
 
+# Time limit and memory guard are user settings (config.script_timeout, config.memory_guard);
+# the defaults below apply when no config is available.
+RUN_PYTHON_TIMEOUT_S = 120    # scripts over this budget are aborted with TimeoutError; 0 = no limit
+_PUMP_EVERY_S = 0.5           # how often the GUI gets to repaint while a script runs
+# Memory guard: a runaway script (per-point booleans, tessellating a whole assembly) can push
+# FreeCAD to tens of GB of commit; Windows then pages so hard the desktop stops responding and
+# only a reboot helps (seen: freecad.exe at 86 GB virtual on a 24 GB box). Abort well before that.
+MEM_ABORT_GROWTH_FRAC = 0.5   # abort when the script has grown the process by this share of RAM
+MEM_ABORT_AVAIL_FRAC = 0.08   # ...or when free physical RAM drops below this share of RAM
+MEM_ABORT_AVAIL_MIN_MB = 1536 # ...or below this absolute amount
+_LAST_RUN_STATS = None        # memory/timing stats of the last run_python, for telemetry
+
+
+def pop_run_stats():
+    """Per-tool stats recorded by the last run_python (or None); cleared on read."""
+    global _LAST_RUN_STATS
+    st, _LAST_RUN_STATS = _LAST_RUN_STATS, None
+    return st
+
+
+class _Watchdog:
+    """Trace hook active while run_python executes on the GUI thread: aborts scripts that
+    exceed the time or memory budget and pumps paint events so FreeCAD never looks frozen.
+    All of it acts between Python lines only - a single long OCC call can still block (or
+    allocate) until it returns."""
+
+    def __init__(self, timeout_s, memory_guard=True):
+        self.timeout_s = timeout_s
+        self.deadline = (time.time() + timeout_s) if timeout_s else None     # None = no time limit
+        self.memory_guard = memory_guard
+        self.next_pump = 0.0
+        st = telemetry.mem_status() or {}
+        self.proc0 = st.get("proc_mb") or 0
+        self.total_mb = st.get("total_mb") or 0
+        self.mem_peak = self.proc0
+        self.mem_avail_min = st.get("avail_mb")
+        self.mem_abort = False
+        self.abort_msg = None
+
+    def check_memory(self):
+        st = telemetry.mem_status()
+        if not st:
+            return
+        proc = st.get("proc_mb") or 0
+        avail = st.get("avail_mb")
+        total = st.get("total_mb") or self.total_mb
+        self.mem_peak = max(self.mem_peak, proc)
+        if avail is not None:
+            self.mem_avail_min = avail if self.mem_avail_min is None else min(self.mem_avail_min, avail)
+        growth = proc - self.proc0
+        too_big = total and growth > total * MEM_ABORT_GROWTH_FRAC
+        too_low = avail is not None and total and avail < max(MEM_ABORT_AVAIL_MIN_MB, total * MEM_ABORT_AVAIL_FRAC)
+        if too_big or too_low:
+            self.mem_abort = True
+            self.abort_msg = (
+                "Script aborted by the memory guard: FreeCAD grew by %d MB (now %d MB) and the machine "
+                "has %s MB of %d MB RAM free - continuing would freeze the whole PC. Work done so far is "
+                "kept (one undo step). Do the job with far less geometry: query BoundBox / distToShape / "
+                "a single section instead of booleans in a loop, operate on one simplified solid "
+                "(shape.copy() of just the part you need, removeSplitter()), avoid tessellating or "
+                "fusing whole assemblies, and free big intermediate shapes (del) between steps."
+                % (growth, proc, "?" if avail is None else avail, total))
+            raise MemoryError(self.abort_msg)
+
+    def stats(self):
+        st = telemetry.mem_status() or {}
+        proc = st.get("proc_mb")
+        return {"mem_delta_mb": (proc - self.proc0) if proc is not None else None,
+                "mem_peak_mb": max(self.mem_peak, proc or 0),
+                "mem_avail_min_mb": self.mem_avail_min, "mem_abort": self.mem_abort}
+
+    def trace(self, frame, event, arg):
+        if event == "line":
+            if self.mem_abort:          # sticky: a script's own `except Exception` can't resume
+                raise MemoryError(self.abort_msg)
+            now = time.time()
+            if self.deadline is not None and now > self.deadline:
+                raise TimeoutError(
+                    "Script exceeded the %d s budget and was aborted (work done so far is kept, "
+                    "one undo step). Use cheaper geometry queries (BoundBox, distToShape, a single "
+                    "slice with several planes) instead of per-point boolean loops, sample fewer "
+                    "points, or split the job into smaller run_python calls." % self.timeout_s)
+            if now >= self.next_pump:
+                self.next_pump = now + _PUMP_EVERY_S
+                if self.memory_guard:
+                    self.check_memory()
+                if QtWidgets is not None:
+                    try:
+                        QtWidgets.QApplication.processEvents(QtCore.QEventLoop.ExcludeUserInputEvents)
+                    except Exception:
+                        pass
+        return self.trace
+
+
 def t_run_python(inp, env):
     code = inp.get("code") or ""
     purpose = inp.get("purpose") or "Run Python in FreeCAD"
@@ -388,8 +497,14 @@ def t_run_python(inp, env):
     if doc:
         doc.openTransaction("FreeGAD: " + purpose[:60])
     ok = True
+    t0 = time.time()
+    cfg = env.get("config")
+    wd = _Watchdog(RUN_PYTHON_TIMEOUT_S if cfg is None else cfg.script_timeout,
+                   True if cfg is None else cfg.memory_guard)
     try:
         with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+            old_trace = sys.gettrace()
+            sys.settrace(wd.trace)
             try:
                 # Try to evaluate the last line as an expression so its value is returned.
                 lines = code.rstrip().split("\n")
@@ -403,6 +518,11 @@ def t_run_python(inp, env):
             except Exception:
                 ok = False
                 result["traceback"] = traceback.format_exc(limit=6)
+            finally:
+                sys.settrace(old_trace)
+        if wd.mem_abort:
+            ns.clear()                  # drop the script's references to big shapes
+            gc.collect()
         if doc:
             try:
                 doc.recompute()
@@ -416,6 +536,11 @@ def t_run_python(inp, env):
                 Gui.updateGui()
             except Exception:
                 pass
+        global _LAST_RUN_STATS
+        _LAST_RUN_STATS = wd.stats()
+    result["seconds"] = round(time.time() - t0, 1)
+    if wd.mem_abort:
+        result["memory_abort"] = True
     out = buf.getvalue()
     if out:
         result["stdout"] = out[-6000:]
@@ -567,6 +692,11 @@ def _mem(env, scope):
 def t_remember(inp, env):
     m = _mem(env, inp.get("scope"))
     e = m.add(inp.get("text"), inp.get("category"))
+    try:
+        from . import dm as _dm
+        _dm.event("memory_used", {"scope": m.scope})     # count only; the note text never leaves the machine
+    except Exception:
+        pass
     return f"Saved to {m.scope} memory as [{e.id}]."
 
 

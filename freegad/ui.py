@@ -3,6 +3,7 @@
 
 """Qt UI: chat dock, API key dialog, memory dialog, settings dialog. Works on PySide2 and PySide6
 through FreeCAD's `PySide` shim."""
+import base64
 import re
 import threading
 import traceback
@@ -17,7 +18,7 @@ from . import client as claude
 from . import config as config_mod
 from . import history as history_mod
 
-VERSION = "1.0.2"
+VERSION = "1.0.3"
 
 _dock = None
 _agent = None
@@ -275,6 +276,24 @@ class SettingsDialog(QtWidgets.QDialog):
         self.auto.setChecked(cfg.auto_approve)
         form.addRow(self.auto)
 
+        self.script_timeout = QtWidgets.QSpinBox()
+        self.script_timeout.setRange(0, 3600)
+        self.script_timeout.setSingleStep(30)
+        self.script_timeout.setSuffix(" s")
+        self.script_timeout.setSpecialValueText("no limit")
+        self.script_timeout.setValue(cfg.script_timeout)
+        self.script_timeout.setToolTip("A run_python script running longer than this is aborted (the GUI is blocked "
+                                       "while it runs). 0 = never abort - for heavy jobs you are willing to wait for.")
+        form.addRow("Script time limit", self.script_timeout)
+
+        self.memory_guard = QtWidgets.QCheckBox("Memory guard: abort scripts that eat most of the RAM")
+        self.memory_guard.setChecked(cfg.memory_guard)
+        self.memory_guard.setToolTip("Aborts a run_python script once it has grown FreeCAD's memory by more than half "
+                                     "of the machine's RAM or less than ~8% is free. A runaway boolean/tessellation loop "
+                                     "can otherwise push Windows into swapping so hard that only a reboot helps. "
+                                     "Turn off only if you know the job legitimately needs that much memory.")
+        form.addRow(self.memory_guard)
+
         self.telemetry = QtWidgets.QCheckBox("Collect anonymous usage data")
         self.telemetry.setToolTip("Sends token usage, latencies, tool timings, GUI hangs and error classes keyed by a "
                                   "random install id. Never prompts, answers, code, file names or the API key.")
@@ -329,7 +348,15 @@ class SettingsDialog(QtWidgets.QDialog):
                                  max_tokens=self.max_tokens.value(),
                                  fallbacks=self.fallbacks.isChecked(),
                                  auto_approve=self.auto.isChecked(),
-                                 telemetry=self.telemetry.isChecked())
+                                 telemetry=self.telemetry.isChecked(),
+                                 script_timeout=self.script_timeout.value(),
+                                 memory_guard=self.memory_guard.isChecked())
+        try:
+            from . import dm as _dm
+            _dm.event("settings", {"provider": p, "telemetry": bool(self.telemetry.isChecked()),
+                                   "auto_approve": bool(self.auto.isChecked())})
+        except Exception:
+            pass
         reload_config()
         if _dock:
             _dock.sync_from_config()
@@ -444,6 +471,66 @@ def confirm_dialog(title, text):
     return run_dialog(dlg) == QtWidgets.QDialog.Accepted
 
 
+# ------------------------------------------------------------------ image attachments
+
+IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp")
+MAX_IMAGE_DIM = 1568        # Anthropic's optimal long side; larger is downscaled server-side anyway
+MAX_PNG_B64 = 1_500_000     # ~1.1 MB binary; beyond this re-encode as JPEG
+
+
+def encode_image(img):
+    """QImage -> (media_type, base64 str). Downscales large images; falls back to JPEG when a
+    PNG would be very big (photos). Returns None for an unreadable image."""
+    if img is None or img.isNull():
+        return None
+    if max(img.width(), img.height()) > MAX_IMAGE_DIM:
+        img = img.scaled(MAX_IMAGE_DIM, MAX_IMAGE_DIM,
+                         QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
+
+    def save(image, fmt, quality=-1):
+        ba = QtCore.QByteArray()
+        buf = QtCore.QBuffer(ba)
+        buf.open(QtCore.QIODevice.WriteOnly)
+        image.save(buf, fmt, quality)
+        buf.close()
+        return base64.b64encode(bytes(ba)).decode("ascii")
+
+    b64 = save(img, "PNG")
+    if len(b64) > MAX_PNG_B64:
+        return "image/jpeg", save(img.convertToFormat(QtGui.QImage.Format_RGB32), "JPEG", 85)
+    return "image/png", b64
+
+
+class ChatInput(QtWidgets.QPlainTextEdit):
+    """Text input that also takes images: pasted from the clipboard (screenshots, copied images)
+    or pasted/dropped image files. Emits image_pasted(QImage) instead of inserting them as text."""
+    image_pasted = QtCore.Signal(object)
+
+    def canInsertFromMimeData(self, source):
+        return source.hasImage() or source.hasUrls() or super().canInsertFromMimeData(source)
+
+    def insertFromMimeData(self, source):
+        if source.hasImage():
+            img = source.imageData()
+            if isinstance(img, QtGui.QPixmap):
+                img = img.toImage()
+            if isinstance(img, QtGui.QImage) and not img.isNull():
+                self.image_pasted.emit(img)
+                return
+        if source.hasUrls():
+            handled = False
+            for url in source.urls():
+                path = url.toLocalFile()
+                if path and path.lower().endswith(IMAGE_EXTS):
+                    img = QtGui.QImage(path)
+                    if not img.isNull():
+                        self.image_pasted.emit(img)
+                        handled = True
+            if handled:
+                return
+        super().insertFromMimeData(source)
+
+
 # ------------------------------------------------------------------ worker
 
 class Worker(QtCore.QThread):
@@ -452,12 +539,13 @@ class Worker(QtCore.QThread):
     failed = QtCore.Signal(str)
     finished_turn = QtCore.Signal()
 
-    def __init__(self, agent, doc, prompt, bridge):
+    def __init__(self, agent, doc, prompt, bridge, images=None):
         super().__init__()
         self.agent = agent
         self.doc = doc
         self.prompt = prompt
         self.bridge = bridge
+        self.images = images or []
 
     def run(self):
         try:
@@ -465,7 +553,8 @@ class Worker(QtCore.QThread):
                            output=self.text.emit,
                            status=self.status.emit,
                            main_call=self.bridge.call,
-                           confirm=lambda t, x: self.bridge.call(lambda: confirm_dialog(t, x)))
+                           confirm=lambda t, x: self.bridge.call(lambda: confirm_dialog(t, x)),
+                           images=self.images)
         except Exception as ex:
             self.failed.emit(str(ex) + "\n" + traceback.format_exc(limit=3))
         finally:
@@ -513,10 +602,20 @@ class ChatDock(QtWidgets.QDockWidget):
         self.view.setOpenExternalLinks(True)
         lay.addWidget(self.view, 1)
 
-        self.input = QtWidgets.QPlainTextEdit()
-        self.input.setPlaceholderText("Ask about the model or tell FreeGAD what to change…  (Ctrl+Enter to send)")
+        self.pending_images = []   # list of (media_type, base64, thumbnail button)
+        self.attach_row = QtWidgets.QWidget()
+        self.attach_lay = QtWidgets.QHBoxLayout(self.attach_row)
+        self.attach_lay.setContentsMargins(0, 0, 0, 0)
+        self.attach_lay.addStretch(1)
+        self.attach_row.hide()
+        lay.addWidget(self.attach_row)
+
+        self.input = ChatInput()
+        self.input.setPlaceholderText("Ask about the model or tell FreeGAD what to change…  "
+                                      "(Ctrl+Enter to send · paste or drop images)")
         self.input.setMaximumHeight(90)
         self.input.installEventFilter(self)
+        self.input.image_pasted.connect(self.add_image)
         lay.addWidget(self.input)
 
         bottom = QtWidgets.QHBoxLayout()
@@ -624,6 +723,34 @@ class ChatDock(QtWidgets.QDockWidget):
                 return True
         return super().eventFilter(obj, ev)
 
+    # -- image attachments
+    def add_image(self, img):
+        enc = encode_image(img)
+        if enc is None:
+            self.append_system("Could not read the pasted image.")
+            return
+        btn = QtWidgets.QToolButton()
+        btn.setIcon(QtGui.QIcon(QtGui.QPixmap.fromImage(
+            img.scaled(44, 44, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation))))
+        btn.setIconSize(QtCore.QSize(44, 44))
+        btn.setToolTip("%d×%d image - click to remove" % (img.width(), img.height()))
+        entry = (enc[0], enc[1], btn)
+        btn.clicked.connect(lambda: self.remove_image(entry))
+        self.pending_images.append(entry)
+        self.attach_lay.insertWidget(self.attach_lay.count() - 1, btn)
+        self.attach_row.show()
+
+    def remove_image(self, entry):
+        if entry in self.pending_images:
+            self.pending_images.remove(entry)
+        entry[2].deleteLater()
+        if not self.pending_images:
+            self.attach_row.hide()
+
+    def clear_images(self):
+        for e in list(self.pending_images):
+            self.remove_image(e)
+
     # -- actions
     def on_auto_toggled(self, on):
         config_mod.save_settings(auto_approve=on)
@@ -652,24 +779,30 @@ class ChatDock(QtWidgets.QDockWidget):
         if self.worker is not None and self.worker.isRunning():
             return
         text = self.input.toPlainText().strip()
-        if not text:
+        images = [(mt, data) for mt, data, _btn in self.pending_images]
+        if not text and not images:
             return
         cfg = reload_config()
         if not cfg.has_api_key:
             self.append_system("No API key. Click **Key** to set one.")
             return
         self.input.clear()
+        self.clear_images()
         self.refresh_doc_label()
         self.load_history()            # switch transcript if the active document changed
-        self.transcript.append(("user", text))
+        shown = text
+        if images:
+            marker = "[%d image%s attached]" % (len(images), "" if len(images) == 1 else "s")
+            shown = (text + "\n" + marker) if text else marker
+        self.transcript.append(("user", shown))
         if self.history is not None:
-            self.history.append("user", text)
+            self.history.append("user", shown)
         self.current = ""
         self.render()
         self.send_btn.setEnabled(False)
         self.status.setText("Thinking…")
 
-        self.worker = Worker(get_agent(), App.ActiveDocument, text, self.bridge)
+        self.worker = Worker(get_agent(), App.ActiveDocument, text, self.bridge, images)
         self.worker.text.connect(self.on_text)
         self.worker.status.connect(self.status.setText)
         self.worker.failed.connect(self.on_failed)

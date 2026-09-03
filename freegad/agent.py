@@ -27,9 +27,11 @@ PERSONA = (
     "set_expression / delete_object are shortcuts. Never tell the user to finish an edit manually "
     "and never open interactive dialogs from code. Each write tool asks the user to confirm, so "
     "just call it. After edits, verify (get_object / recompute / screenshot) and briefly confirm "
-    "what changed. Be economical with tool calls: every call re-sends the conversation, so batch "
-    "related work into one run_python, ask get_object only for objects you need, and take at most "
-    "one screenshot per edit cycle. Object Names are internal ids (e.g. 'Pad001'); Labels are what the user sees - "
+    "what changed. Be economical with tool calls: every call re-sends the conversation. Plan the "
+    "explore-act-verify cycle as THREE run_python calls, not five: gather ALL the measurements and "
+    "geometry you will need (faces, bounding boxes, clearances) in ONE inspection script before "
+    "editing, make the edit in one script, verify once. Ask get_object only for objects you need, "
+    "and take at most one screenshot per edit cycle. Object Names are internal ids (e.g. 'Pad001'); Labels are what the user sees - "
     "refer to objects by Label in prose and by Name in tools. Answer concisely; lead with the result.\n\n"
     "You keep notes between sessions with the remember tool: scope='document' for facts about the "
     "current file, scope='user' for how this person works. Be PROACTIVE about this - it is what "
@@ -157,11 +159,20 @@ class Agent:
             return s.user_mem, s.doc_mem
         return memory.Memory.load_user(), (memory.Memory.load_document(doc) if doc else None)
 
-    def ask(self, doc, user_text, output, status, main_call, confirm):
-        """One user turn. output(text) streams assistant text; status(text) shows progress."""
+    def ask(self, doc, user_text, output, status, main_call, confirm, images=None):
+        """One user turn. output(text) streams assistant text; status(text) shows progress.
+        images: optional list of (media_type, base64_data) attached to the prompt."""
         s = self.state(doc, main_call)
         compact_history(s.history)
-        s.history.append({"role": "user", "content": user_text})
+        if images:
+            content = [{"type": "image",
+                        "source": {"type": "base64", "media_type": mt, "data": data}}
+                       for mt, data in images]
+            if user_text:
+                content.append({"type": "text", "text": user_text})
+            s.history.append({"role": "user", "content": content})
+        else:
+            s.history.append({"role": "user", "content": user_text})
         env = {"doc": doc, "user_mem": s.user_mem, "doc_mem": s.doc_mem,
                "config": self.cfg, "confirm": confirm}
         try:
@@ -176,6 +187,7 @@ class Agent:
             m.error = type(ex).__name__ + ": " + str(ex)[:200]
             raise
         finally:
+            telemetry.clear_inflight()
             telemetry.send("turn", m.payload())
             cost = m.cost_usd if m.has_cost else \
                 estimate_cost(self.cfg.model, m.input_tokens, m.output_tokens, m.cache_read, m.cache_create)
@@ -184,8 +196,8 @@ class Agent:
                 cost_txt = "≈ ${:.2f} this turn, ${:.2f} this session".format(cost, self.session_cost)
             else:
                 cost_txt = "cost n/a (no list price known for %s)" % self.cfg.model
-            output("\n\n_{} calls · in {:,} (+{:,} cached) · out {:,} · {}_\n".format(
-                m.api_calls, m.input_tokens, m.cache_read, m.output_tokens, cost_txt))
+            output("\n\n_{} calls · in {:,} (+{:,} cache-read, {:,} cache-write) · out {:,} · {}_\n".format(
+                m.api_calls, m.input_tokens, m.cache_read, m.cache_create, m.output_tokens, cost_txt))
 
     def _run(self, s, env, m, output, status, main_call):
         for _ in range(MAX_ITERATIONS):
@@ -221,6 +233,9 @@ class Agent:
                     output(f"\n`[{tname}]`\n")
                     t0, c0 = time.time(), time.process_time()
                     ok = True
+                    # If this tool takes the process down (OOM -> reboot), the marker is reported
+                    # as a crashed turn at the next start.
+                    telemetry.mark_inflight(dict(m.payload(), crashed_in=tname))
                     try:
                         result = main_call(lambda: tools.execute(tname, tinput, env))
                         if isinstance(result, str) and len(result) > MAX_TOOL_RESULT_CHARS:
@@ -232,7 +247,8 @@ class Agent:
                               "content": f"Error: {ex}", "is_error": True}
                     declined = isinstance(tr.get("content"), str) and tr["content"].startswith("User declined")
                     m.tool(tname, (time.time() - t0) * 1000, (time.process_time() - c0) * 1000, ok,
-                           confirmed=(not declined) if tname in tools.WRITE_TOOLS else None)
+                           confirmed=(not declined) if tname in tools.WRITE_TOOLS else None,
+                           mem=tools.pop_run_stats())
                     tool_results.append(tr)
 
             if stop == "refusal":

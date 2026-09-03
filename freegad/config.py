@@ -7,6 +7,8 @@
     apiKeyEnc         Anthropic key      | model         Anthropic model
     openaiApiKeyEnc   OpenAI-compat key  | openaiModel   OpenAI-compat model | openaiBaseUrl
     maxTokens, effort, fallbacks (Anthropic only), autoApprove, telemetry, installId, telemetryUrl
+    scriptTimeout     seconds a run_python script may take (0 = no limit) | memoryGuard  abort scripts
+                      that eat most of the RAM (true/false)
 
 Keys are stored DPAPI-encrypted for the current Windows user, never in plain text. A plain-text
 "apiKey" (or the installer's apikey.pending file) is migrated to the encrypted field on first read.
@@ -25,6 +27,8 @@ DEFAULT_OPENAI_MODEL = "gpt-5"
 DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_MAX_TOKENS = 16000
 DEFAULT_EFFORT = "high"
+DEFAULT_SCRIPT_TIMEOUT = 120      # seconds; 0 = unlimited
+DEFAULT_MEMORY_GUARD = True
 
 EFFORTS = ["low", "medium", "high", "xhigh", "max"]
 KNOWN_MODELS = ["claude-opus-5", "claude-fable-5", "claude-sonnet-5", "claude-opus-4-8"]
@@ -76,6 +80,8 @@ def _template():
         "effort": DEFAULT_EFFORT,
         "fallbacks": True,
         "autoApprove": False,
+        "scriptTimeout": DEFAULT_SCRIPT_TIMEOUT,
+        "memoryGuard": DEFAULT_MEMORY_GUARD,
         "telemetry": True,
         "installId": "",
         "telemetryUrl": "",
@@ -149,6 +155,8 @@ class Config:
         self.effort = DEFAULT_EFFORT
         self.fallbacks = True
         self.auto_approve = False
+        self.script_timeout = DEFAULT_SCRIPT_TIMEOUT
+        self.memory_guard = DEFAULT_MEMORY_GUARD
         self.telemetry = True
         self.install_id = ""
         self.telemetry_url = ""
@@ -213,6 +221,11 @@ class Config:
             c.effort = DEFAULT_EFFORT
         c.fallbacks = bool(o.get("fallbacks", True))
         c.auto_approve = bool(o.get("autoApprove", False))
+        try:
+            c.script_timeout = max(0, int(o.get("scriptTimeout", DEFAULT_SCRIPT_TIMEOUT)))
+        except Exception:
+            c.script_timeout = DEFAULT_SCRIPT_TIMEOUT
+        c.memory_guard = bool(o.get("memoryGuard", DEFAULT_MEMORY_GUARD))
         c.telemetry = bool(o.get("telemetry", True))
         c.telemetry_url = str(o.get("telemetryUrl") or "")
         c.install_id = str(o.get("installId") or "")
@@ -302,7 +315,8 @@ def clear_api_key(provider=None):
 
 
 def save_settings(provider=None, model=None, openai_model=None, openai_base_url=None, max_tokens=None,
-                  effort=None, fallbacks=None, auto_approve=None, telemetry=None):
+                  effort=None, fallbacks=None, auto_approve=None, telemetry=None,
+                  script_timeout=None, memory_guard=None):
     o = _read_json() or _template()
     if provider is not None:
         o["provider"] = normalize_provider(provider)
@@ -322,4 +336,8 @@ def save_settings(provider=None, model=None, openai_model=None, openai_base_url=
         o["autoApprove"] = bool(auto_approve)
     if telemetry is not None:
         o["telemetry"] = bool(telemetry)
+    if script_timeout is not None:
+        o["scriptTimeout"] = max(0, int(script_timeout))
+    if memory_guard is not None:
+        o["memoryGuard"] = bool(memory_guard)
     _write(o)

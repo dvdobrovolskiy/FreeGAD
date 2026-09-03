@@ -158,6 +158,8 @@ try:
     from . import config as _config
     _config.Config.load()      # creates %APPDATA%/FreeGAD + memory dirs, migrates an installer-provided key
     from . import telemetry as _telemetry
+    _telemetry.dm_init()           # anonymous usage statistics (first_run / session) -> dobrovolskiy.com
+    _telemetry.flush_inflight()    # report a turn that died with the previous FreeCAD process
     _telemetry.send("session", {})
 except Exception as _ex:
     App.Console.PrintWarning("FreeGAD: config init failed: %s\n" % _ex)

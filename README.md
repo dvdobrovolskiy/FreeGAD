@@ -1,5 +1,11 @@
 # FreeGAD — AI-powered assistant for FreeCAD
 
+by Dmitriy Dobrovolskiy · https://dobrovolskiy.com/work/freegad · **Download for Windows:**
+https://dobrovolskiy.com/go/freegad-win?src=github (latest installer) · Free, AGPL-3.0
+
+<!-- TODO: hero screenshot of the docked chat panel next to a model (resources/media/hero.png)
+     and a 20-second GIF: sketch -> constraint -> measure -> edit with the confirmation dialog -->
+
 A persistent, in-CAD AI agent. Literally does work for you. Direct prompt to 3D models conversion, any 3D manipulation by prompt. Ask questions about the active document, run engineering
 calculations, and (with confirmation) modify the model — all from a docked chat panel.
 Backed by the Claude API (`claude-opus-5` by default) — or any OpenAI-compatible API (OpenAI,
@@ -35,6 +41,21 @@ What AI can do inside FreeCAD:
   (conventions, printer, materials, how you like answers) and per-document notes (design intent,
   which sketch drives what). Documents are keyed by their `Uid`, so notes survive renames/moves.
   Nothing is written into the `.FCStd`.
+
+## What it can't do (yet)
+
+- **Windows only.** The installer, the DPAPI key storage and the memory guard are Windows code; no
+  Linux or macOS build yet.
+- **FreeCAD 1.0 and 1.1 only** (`package.xml` says `freecadmin 1.0.0`); 0.21 is not supported.
+- **Needs your own API key and every turn costs money** — the panel prints tokens and an estimated
+  price after each answer. A local OpenAI-compatible server works too if you want zero API cost.
+- **It edits only with your confirmation.** Every write tool pops a dialog with the exact code or
+  change (unless you tick *Auto-approve edits*). It cannot run while you are away and it cannot
+  batch-process files you have not opened.
+- **It sees the document, not your screen** — one snapshot per message plus what the tools read and
+  the viewport screenshot it asks for; it does not watch you work.
+- No TechDraw, Path/CAM or FEM-specific tools; those go through `run_python` and the general
+  FreeCAD API.
 
 ## Install
 
@@ -97,10 +118,26 @@ history** deletes the current document's file.
 ## Usage telemetry (on by default, opt-out)
 
 **Settings… → Collect anonymous usage data.** Each turn sends: model/effort, token counts
-(input/output/cache), API and tool latencies, how long the GUI thread was blocked (hang ≥ 2 s),
-process CPU time, error class, plugin/FreeCAD/OS versions, object count — keyed by a random
-`installId`. Never sent: prompts, answers, code, file names, document contents, the API key.
+(input/output/cache, per API call), API and tool latencies, how long the GUI thread was blocked
+(hang ≥ 2 s), FreeCAD's memory growth per `run_python`, process CPU time, error class,
+plugin/FreeCAD/OS versions, object count — keyed by a random `installId`. Never sent: prompts,
+answers, code, file names, document contents, the API key.
 Events that fail to send are spooled in `%APPDATA%\FreeGAD\telemetry\` (≤ 512 KB) and retried.
+A turn that dies with the FreeCAD process (crash, out-of-memory, reboot) is reported on the next
+start as a turn with a `ProcessDied` error.
+
+> **Anonymous usage statistics.** With the same switch on, the addon also sends a random install id,
+> its version, OS version and which features are used (event names and counts: first run, session,
+> turn, settings saved, memory note saved) to dobrovolskiy.com so I can see what to improve. It never
+> sends file names, file contents, prompts, answers, or anything typed. Turn it off with
+> **Settings… → Collect anonymous usage data**, or set `"enabled": false` in
+> `%APPDATA%\FreeGAD\metrics.json`, or set the environment variable `DM_DISABLE=1`.
+
+**Settings… → Script time limit / Memory guard** (both on by default): `run_python` scripts are
+aborted after the time limit (120 s; set 0 for heavy jobs you are willing to wait for), and as soon
+as one grows FreeCAD's memory by more than half of the machine's RAM or leaves less than ~8 % free —
+a runaway boolean/tessellation loop can otherwise push Windows into swapping so hard that only a
+reboot helps. Untick the guard only if a job legitimately needs that much memory.
 
 Backend + dashboard: `server/` (FastAPI + SQLite, SvelteKit static build) at
 https://freecad.dobrovolskiy.com (login required). Deploy with `deploy-server.ps1`
@@ -117,6 +154,7 @@ freegad/context.py       compact document snapshot / object detail
 freegad/memory.py        persistent notes (user + per-document)
 freegad/client.py        raw HTTP client for POST /v1/messages (stdlib only)
 freegad/config.py        config.json, DPAPI-encrypted key, installer key hand-off
+freegad/telemetry.py     per-turn LLM metrics -> freecad.dobrovolskiy.com; freegad/dm.py usage counts -> dobrovolskiy.com
 freegad/ui.py            chat dock, API key / settings / memory dialogs, worker thread
 install.ps1              dev install / key management
 Installer.iss            Inno Setup script; make_installer.bat builds FreeGADSetup.exe
